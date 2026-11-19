@@ -1,0 +1,42 @@
+{
+    "name": "@sksoftofficial/rigline",
+    "version": "0.1.0",
+    "description": "Embeddable Node.js LLM agent loop with caller-registered tools (OpenRouter / OpenAI-compatible transport)",
+    "type": "module",
+    "license": "MIT",
+    "author": "skbilisim",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/sksoftofficial/rigline.git"
+    },
+    "bugs": {
+        "url": "https://github.com/sksoftofficial/rigline/issues"
+    },
+    "homepage": "https://github.com/sksoftofficial/rigline#readme",
+    "main": "./src/Agent.js",
+    "exports": {
+        ".": "./src/Agent.js",
+        "./tools": "./src/tools/index.js",
+        "./package.json": "./package.json"
+    },
+    "engines": {
+        "node": ">=20"
+    },
+    "files": [
+        "src",
+        "README.md"
+    ],
+    "scripts": {
+        "test": "node --test"
+    },
+    "keywords": [
+        "agent",
+        "agent-loop",
+        "llm",
+        "tools",
+        "function-calling",
+        "openrouter",
+        "openai",
+        "brave-search"
+    ]
+}
