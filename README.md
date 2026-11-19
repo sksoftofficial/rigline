@@ -6,8 +6,8 @@ in-process by your worker code. A **library** — no CLI, no server, no config f
 - Zero runtime dependencies (global `fetch` + `node:` builtins), ESM only, Node.js >= 20.
 - OpenAI-compatible transport, OpenRouter by default; any compatible host via `baseUrl`.
 - You own the domain: built-ins are the file toolkit (`read` / `write` / `edit` / `patch` / `glob` / `grep`)
-  plus `webfetch` / `websearch`, conventions inherited from [opencode](https://github.com/sst/opencode);
-  everything else is registered by the host.
+  — always registered, sandboxed to a per-run session workspace — plus opt-in `webfetch` / `websearch`,
+  conventions inherited from [opencode](https://github.com/sst/opencode); everything else is registered by the host.
 
 ## Install
 
@@ -25,9 +25,6 @@ npm install /absolute/path/to/rigline
 
 ```js
 import { Agent } from 'rigline';
-import { readTool, writeTool } from 'rigline/tools';
-
-const workDir = '/data/editorial/job-42';
 
 const agent = new Agent({
     transport: {
@@ -35,14 +32,17 @@ const agent = new Agent({
         model: 'anthropic/claude-sonnet-4.5',      // provider-prefixed OpenRouter slug
     },
     systemPrompt: 'You are a careful editorial assistant.',
-    tools: [readTool({ root: workDir }), writeTool({ root: workDir })],
     maxSteps: 24,
     requestTimeoutMs: 120000,
     onStep: (step) => console.log('step', step.step, step.toolResults.map((r) => r.name)),
 });
 
-const result = await agent.run('Read notes.txt in the work dir and draft a headline into draft.md');
-// result: { text, messages, steps, usage: { promptTokens, completionTokens, cost? } }
+await agent.workspace.put('notes.txt', notes);    // stage files into this run's session workspace
+
+const result = await agent.run('Read notes.txt and draft a headline into draft.md');
+// result: { text, messages, steps, usage: { promptTokens, completionTokens, totalTokens, reasoningTokens?, cachedTokens?, cost? } }
+// read/write/edit/patch/glob/grep are always registered — confined to the
+// per-run session folder, cleaned up when the run settles.
 ```
 
 ## Custom tools
@@ -87,7 +87,7 @@ const next = await agent.run([...result.messages, { role: 'user', content: 'Now 
 | `transport.headers` | object | `{}` | extra headers, merged after the standard ones (can override) |
 | `systemPrompt` | string | — | prepended as `role: 'system'` for string prompts |
 | `tools` | array | `[]` | tool objects, same shape as `registerTool` |
-| `sandboxed` | `true` \| string | — | `true` → per-run session folders under `tmpdir()/rigline` (Linux: `/tmp/rigline`); a path string → that directory as the base. Auto-registers all six built-in tools scoped to the session folder and exposes `agent.workspace`. See [Sandbox & workspace](#sandbox--workspace) |
+| `workspace` | string | `tmpdir()/rigline` | base directory for the per-run `session-*` folders every agent gets. The six built-in file tools are **always** registered and confined to the session folder. See [Workspace](#workspace) |
 | `maxSteps` | number | `24` | max model round-trips per `run()` |
 | `requestTimeoutMs` | number | `120000` | covers the whole request incl. retries; aborts on expiry |
 | `reasoning` | object | — | sent verbatim as the request's `reasoning` param, e.g. `{ enabled: true, max_tokens: 128 }`; see below |
@@ -98,10 +98,10 @@ const next = await agent.run([...result.messages, { role: 'user', content: 'Now 
 
 | field | notes |
 | --- | --- |
-| `name` | must match `/^[a-zA-Z0-9_-]{1,64}$/`; duplicate registration throws |
+| `name` | must match `/^[a-zA-Z0-9_-]{1,64}$/`; same-name registration **replaces** the existing tool (built-ins included) |
 | `description` | what the model sees |
 | `parameters` | JSON Schema object (`{ type: 'object', properties, required }`) |
-| `execute` | `async (args) => result`; throw = recoverable tool error |
+| `execute` | `async (args, { workspaceDir }) => result` — the session workspace folder, when a run is in flight; throw = recoverable tool error |
 
 ### `agent.run(input)` → `Promise<{ text, messages, steps, usage }>`
 
@@ -111,8 +111,14 @@ const next = await agent.run([...result.messages, { role: 'user', content: 'Now 
   result with its matching `tool_call_id`, and loops.
 - Stops at the first tool-free assistant reply (its text becomes `result.text`), or throws
   `MaxStepsError` (`.messages` = full transcript) when `maxSteps` is exceeded.
-- `usage`: `{ promptTokens, completionTokens }` summed over the run, plus `cost` (USD) summed
-  when OpenRouter returns `usage.cost`.
+- `usage`: `{ promptTokens, completionTokens, totalTokens }` summed over the run, plus
+  `reasoningTokens` (billed thinking, a **subset of** `completionTokens`),
+  `cachedTokens` (prompt cache hits, a **subset of** `promptTokens`), and `cost` (USD) —
+  each present only when the provider reported it at least once (never-reported ≠ 0).
+  `totalTokens` derives as prompt+completion per step when a provider omits `total_tokens`.
+  Detail readers accept the OpenRouter/OpenAI names (`prompt_tokens_details.cached_tokens`,
+  `completion_tokens_details.reasoning_tokens`) and the Anthropic-style aliases
+  (`cached_tokens`, `cache_read_input_tokens`, `reasoning_tokens`, `output_tokens_details.reasoning_tokens`).
 
 ### `agent.runJson(input)` → parsed JSON
 
@@ -134,15 +140,19 @@ accordingly.
 ```js
 import { readTool, writeTool, editTool, patchTool, globTool, grepTool, webfetchTool, websearchTool } from 'rigline/tools';
 
-readTool({ root: workDir });    // read({ path, offset?, limit? }) -> files AND directories
-writeTool({ root: workDir });   // write({ path, content }) -> create/overwrite, makes parent dirs
-editTool({ root: workDir });    // edit({ path, oldString, newString, replaceAll? }) -> exact replace
-patchTool({ root: workDir });   // patch({ patchText }) -> atomic multi-file add/update/move/delete
-globTool({ root: workDir });    // glob({ pattern, path?, hidden?, limit? }) -> matching file paths
-grepTool({ root: workDir });    // grep({ pattern, path?, include?, literal?, caseSensitive?, limit? })
-webfetchTool();                 // webfetch({ url, format?, timeout? }) -> fetch a URL as markdown
-websearchTool({ apiKey });      // websearch({ query }) -> Brave Search results as markdown
+readTool();                    // read({ path, offset?, limit? }) -> files AND directories
+writeTool();                   // write({ path, content }) -> create/overwrite, makes parent dirs
+editTool();                    // edit({ path, oldString, newString, replaceAll? }) -> exact replace
+patchTool();                   // patch({ patchText }) -> atomic multi-file add/update/move/delete
+globTool();                    // glob({ pattern, path?, hidden?, limit? }) -> matching file paths
+grepTool();                    // grep({ pattern, path?, include?, literal?, caseSensitive?, limit? })
+webfetchTool();                // webfetch({ url, format?, timeout? }) -> fetch a URL as markdown
+websearchTool({ apiKey });     // websearch({ query }) -> Brave Search results as markdown
 ```
+
+The six file tools take **no options**: every agent already registers them, scoped to
+its per-run session workspace (see [Workspace](#workspace)). Importing them is only
+needed for standalone use. `webfetch`/`websearch` are network tools — opt in via `tools`.
 
 Conventions inherited from [opencode](https://github.com/sst/opencode)'s toolset.
 
@@ -204,8 +214,11 @@ One atomic multi-file operation in the Vercel `*** Begin Patch` format:
 *** End Patch
 ```
 
-- `@@ context` repositions at the next file line containing that text; `-`/`+`/` `
-  lines then remove/add/verify lines after it. `*** End of File` truncates the file.
+- `@@ context` repositions at the next file line containing that text — the matched
+  line is **kept**, and `-`/`+`/` ` lines apply to the lines *after* it (to edit the
+  context line itself, anchor on an earlier line). The context must be **on the same
+  line** — a bare `@@` is rejected (it would match every line and land the chunk at
+  the wrong offset). `*** End of File` truncates the file.
 - **All-or-nothing**: every file section is verified against disk (chaining earlier
   sections of the same patch — add then update works) before anything is written; one
   bad line applies nothing.
@@ -222,7 +235,7 @@ Pure-JavaScript search (no ripgrep binary, no deps):
   using a more specific path or pattern.)`.
 - Walk deviations from ripgrep: no `.gitignore` handling, `.git` always skipped, hidden
   entries skipped unless `glob`'s `hidden: true`, and symlinked directories are never
-  followed (walks cannot escape `root`).
+  followed (walks cannot escape the session workspace).
 
 ### `webfetch`
 
@@ -248,9 +261,9 @@ markdown converter (no htmlparser2, no turndown):
   with a plain client user agent; `webfetchTool({ userAgent })` overrides
   the default `Rigline-User` agent.
 
-`webfetch` is network-scoped, not filesystem-scoped: it takes no `root`, and
-`sandboxed` does **not** auto-register it — add it via `tools` if you want it
-in a sandboxed agent. Errors read `Unable to fetch <url>: <reason>`
+`webfetch` is network-scoped, not filesystem-scoped: it touches no files and is
+**not** one of the always-registered built-ins — add it via `tools` if you want it.
+Errors read `Unable to fetch <url>: <reason>`
 (`response status 404`, `request timed out after 30s`, ...). SSRF posture is
 the host's call: wrap `execute` or don't register the tool for untrusted
 models.
@@ -286,47 +299,54 @@ const agent = new Agent({
   `Unable to search the web for "<query>": <detail>`.
 - Descriptions are requested undecorated (`text_decorations=false`) so no
   `<strong>` highlight markup leaks into the markdown.
-- Network-scoped like `webfetch`: no `root`, not auto-registered by
-  `sandboxed` — opt in via `tools`.
+- Network-scoped like `webfetch`: touches no filesystem, not one of the
+  always-registered built-ins — opt in via `tools`.
 
 ### All built-in file tools
 
-- **Require** `root`; there is no default (and never `/`).
-- Paths are relative and confined to `root`: absolute paths and `..` escapes are rejected
-  with a clear error, and paths are verified against real paths — a symlink inside `root`
-  pointing outside is rejected too (best-effort; see the sandbox notes on TOCTOU).
+- Take **no options** and are already registered on every agent — the model-facing
+  path argument is always relative to the per-run session workspace.
+- Paths are confined to that session folder: absolute paths and `..` escapes are rejected
+  with a clear error, and paths are verified against real paths — a symlink inside the
+  workspace pointing outside is rejected too (best-effort; see the workspace notes on
+  TOCTOU).
 
-## Sandbox & workspace
+## Workspace
 
-Pass `sandboxed` to give every run its own scratch folder the built-in tools cannot
-escape — no `root` wiring, no cleanup bookkeeping on your side:
+Every agent — no opt-in — gives each `run()` its own `session-*` folder under a shared
+base directory (the `workspace` option, default `tmpdir()/rigline` on Linux
+`/tmp/rigline`). The six built-in file tools are always registered and can only touch
+that folder; nothing else on disk is reachable through them:
 
 ```js
 const agent = new Agent({
     transport: { apiKey, model },
-    sandboxed: true,              // base: tmpdir()/rigline — or pass '/path/to/base'
+    workspace: '/data/rigline-sessions',   // optional — default tmpdir()/rigline
 });
 
 await agent.workspace.put('input.txt', data);   // stage into the session folder
 
 const result = await agent.run('process input.txt');
-// read/write/edit/patch/glob/grep are already registered, scoped to
-// session-<id>/ for this run; the folder is removed just before run() returns.
+// read/write/edit/patch/glob/grep run inside session-<id>/ for this run;
+// the folder is removed just before run() returns.
 ```
 
 Lifecycle — each `run()` call is one session:
 
 - A fresh `session-*` folder is created under the base, lazily: when you stage files
   via `put()`, otherwise at run start.
-- All six built-in **file** tools are auto-registered scoped to that folder (`webfetch`
-  is network-scoped and not auto-registered — opt in via `tools`). Absolute paths,
-  `..` escapes, and symlinks pointing outside are rejected. Passing your own tool with
-  one of those names in `tools` throws (the sandbox already registers them).
+- File tools receive the session folder at execution time — they never take a root at
+  construction, so the correct folder always matches the run in flight. Custom tools
+  get it too, as `execute(args, { workspaceDir })` — **any** tool that touches the
+  filesystem should confine itself to it.
+- Absolute paths, `..` escapes, and symlinks pointing outside the session folder are
+  rejected. Passing your own tool with a built-in name (`read`, `write`, `edit`,
+  `patch`, `glob`, `grep`) via `tools` is fine — it **overrides** the built-in.
 - When the run settles — final answer, `MaxStepsError`, or any failure — the session
   folder is removed (best-effort) before control returns. The base directory stays.
 
-`agent.workspace` (undefined without `sandboxed`) — host-side helpers with the same
-confinement, so your app never does raw `fs` against the sandbox:
+`agent.workspace` — host-side helpers with the same confinement, so your app never
+does raw `fs` against the session:
 
 | helper | notes |
 | --- | --- |
@@ -338,11 +358,14 @@ confinement, so your app never does raw `fs` against the sandbox:
 
 Limits worth knowing:
 
-- **Files do not outlive the run** — get results back via the final text. A `keep`
-  option is a trivial future addition if post-run file retrieval is ever needed.
-- Only the built-in tools are confined; custom tools you register are arbitrary host
-  code and can go anywhere.
-- A sandboxed agent runs **one `run()` at a time** — the session is per run.
+- **Files do not outlive the run** — get results back via the final text or read them
+  from `onStep` while the run is in flight (`onStep` is not awaited; an async callback
+  on the final step races the cleanup). A `keep` option is a trivial future addition
+  if post-run file retrieval is ever needed.
+- Built-in tools are confined by construction; custom tools you register are host
+  code — keep any that touch the filesystem inside `workspaceDir` from their execute
+  context.
+- An agent runs **one `run()` at a time** — the session is per run.
 - Symlink checks race nothing in practice but are verified once before each IO; a
   symlink swapped in between check and IO can still escape (TOCTOU, best-effort).
 

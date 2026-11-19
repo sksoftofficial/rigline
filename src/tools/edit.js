@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { readFile, stat, writeFile } from 'node:fs/promises';
-import { resolveInsideRoot, assertRealInsideRoot } from '../lib/paths.js';
+import { resolveInsideRoot, assertRealInsideRoot, sessionWorkspaceRoot } from '../lib/paths.js';
 import { unifiedDiff } from '../lib/diff.js';
 
 // Ported from opencode's edit tool. Three-tier matching ladder against the
@@ -266,19 +266,14 @@ function missHint(source, oldString, newString) {
     ].join('\n');
 }
 
-export function editTool({ root } = {}) {
-    if (typeof root !== 'string' || root.trim().length === 0) {
-        throw new TypeError('editTool requires a root option: the base directory all edits are confined to');
-    }
-    const rootDir = path.resolve(root);
-
+export function editTool() {
     return {
         name: 'edit',
         description: 'Edit the contents of a file by finding and replacing exact text. When editing text from the read tool\'s output, preserve the exact indentation (tabs or spaces) and omit the line-number prefix, such as `1: `. Never include the prefix in oldString or newString. Write line breaks as \\n; the file\'s existing CRLF or LF line endings are matched and preserved. To change line endings themselves, make oldString and newString differ only in \\r; that edit applies to the exact bytes. If there is no exact match, the edit retries while ignoring typographic quote, dash, and space variants, then trailing whitespace on each line. The edit fails if oldString is not found. By default, oldString must identify a UNIQUE location. Multiple matches FAIL unless replaceAll is true. Add more surrounding context to disambiguate, or set replaceAll to true to replace every occurrence. Use replaceAll when the change should apply to every occurrence, such as renaming a variable.',
         parameters: {
             type: 'object',
             properties: {
-                path: { type: 'string', description: 'File to edit, relative to the working root directory.' },
+                path: { type: 'string', description: 'File to edit, relative to the session workspace.' },
                 oldString: { type: 'string', description: 'Exact text to find and replace.' },
                 newString: { type: 'string', description: 'Text to replace oldString with (must differ from oldString).' },
                 replaceAll: { type: 'boolean', description: 'Whether to replace every occurrence of oldString. When false, oldString must match exactly once. Defaults to false.' }
@@ -286,7 +281,8 @@ export function editTool({ root } = {}) {
             required: ['path', 'oldString', 'newString'],
             additionalProperties: false
         },
-        execute: async (args) => {
+        execute: async (args, context) => {
+            const rootDir = sessionWorkspaceRoot(context, 'edit');
             if (typeof args?.oldString !== 'string' || typeof args?.newString !== 'string') {
                 throw new Error('oldString and newString must be strings');
             }

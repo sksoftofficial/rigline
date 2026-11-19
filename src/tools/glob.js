@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { stat } from 'node:fs/promises';
-import { resolveInsideRoot, assertRealInsideRoot } from '../lib/paths.js';
+import { resolveInsideRoot, assertRealInsideRoot, sessionWorkspaceRoot } from '../lib/paths.js';
 import { walkFiles } from '../lib/fs-walk.js';
 import { globMatches } from '../lib/glob.js';
 
@@ -12,12 +12,7 @@ const DEFAULT_LIMIT = 100;
 
 const TRUNCATION_NOTE = (count) => `(Results are truncated: showing first ${count} results. Consider using a more specific path or pattern.)`;
 
-export function globTool({ root } = {}) {
-    if (typeof root !== 'string' || root.trim().length === 0) {
-        throw new TypeError('globTool requires a root option: the base directory all searches are confined to');
-    }
-    const rootDir = path.resolve(root);
-
+export function globTool() {
     return {
         name: 'glob',
         description: 'Search file paths using a glob pattern (examples: "**/*.ts", "src/**/*.md", "**/*.{json,md}"). Returns matching file paths, one per line, when you need to find files by name or extension. Hidden files (dot-prefixed) are skipped unless hidden is true.',
@@ -25,14 +20,15 @@ export function globTool({ root } = {}) {
             type: 'object',
             properties: {
                 pattern: { type: 'string', description: 'Glob pattern to match file paths against.' },
-                path: { type: 'string', description: 'Directory to search. Defaults to the working root directory.' },
+                path: { type: 'string', description: 'Directory to search. Defaults to the session workspace.' },
                 hidden: { type: 'boolean', description: 'Include hidden files and directories (default: false).' },
                 limit: { type: 'integer', description: `Maximum number of matching files to return (default: ${DEFAULT_LIMIT}).` }
             },
             required: ['pattern'],
             additionalProperties: false
         },
-        execute: async (args) => {
+        execute: async (args, context) => {
+            const rootDir = sessionWorkspaceRoot(context, 'glob');
             if (typeof args?.pattern !== 'string' || args.pattern.length === 0) {
                 throw new Error('pattern must be a non-empty string');
             }

@@ -16,8 +16,8 @@ import {
     requestBody
 } from './helpers.js';
 
-test('sandboxed: true stages into tmpdir()/rigline session-* and removes it when the run resolves', async (t) => {
-    const { agent } = makeAgent(t, [completion(textMessage('done'))], { sandboxed: true });
+test('every agent gets a session workspace: default base tmpdir()/rigline, removed when the run resolves', async (t) => {
+    const { agent } = makeAgent(t, [completion(textMessage('done'))]);
 
     await agent.workspace.put('input.txt', 'staged');
     const dir = agent.workspace.dir();
@@ -30,14 +30,14 @@ test('sandboxed: true stages into tmpdir()/rigline session-* and removes it when
     assert.ok(existsSync(join(tmpdir(), 'rigline')), 'the base workspace stays');
 });
 
-test('built-in tools are auto-registered and run inside the staged session folder', async (t) => {
+test('the six built-in file tools are always registered and run inside the session folder', async (t) => {
     const { agent, fetchMock } = makeAgent(t, [
         completion(toolCallsMessage([
             toolCall('c1', 'read', { path: 'input.txt' }),
             toolCall('c2', 'write', { path: 'out/result.txt', content: 'result data' })
         ])),
         completion(textMessage('done'))
-    ], { sandboxed: true });
+    ]);
 
     await agent.workspace.put('input.txt', 'staged');
     const dir = agent.workspace.dir();
@@ -54,9 +54,33 @@ test('built-in tools are auto-registered and run inside the staged session folde
     assert.ok(!existsSync(dir));
 });
 
+test('custom tools receive the session folder as execute context and can use it for filesystem work', async (t) => {
+    let seenDir = null;
+    const writer = {
+        name: 'note',
+        description: 'writes a note',
+        parameters: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'], additionalProperties: false },
+        execute: async (args, context) => {
+            seenDir = context?.workspaceDir;
+            return 'noted';
+        }
+    };
+    const { agent } = makeAgent(t, [
+        completion(toolCallsMessage([toolCall('c1', 'note', { text: 'hi' })])),
+        completion(textMessage('done'))
+    ], { tools: [writer] });
+    await agent.workspace.put('seed.txt', 'x'); // stages the session run() will adopt
+    const stagedDir = agent.workspace.dir();
+
+    await agent.run('take a note');
+
+    assert.equal(seenDir, stagedDir, 'execute context must be the session folder the run adopted');
+    assert.ok(typeof seenDir === 'string' && seenDir.includes('session-'));
+});
+
 test('the session folder is removed even when the run fails (MaxStepsError)', async (t) => {
     const toolTurn = () => completion(toolCallsMessage([toolCall('c', 'read', { path: 'input.txt' })]));
-    const { agent } = makeAgent(t, [toolTurn(), toolTurn()], { sandboxed: true, maxSteps: 2 });
+    const { agent } = makeAgent(t, [toolTurn(), toolTurn()], { maxSteps: 2 });
 
     await agent.workspace.put('input.txt', 'x');
     const dir = agent.workspace.dir();
@@ -69,7 +93,7 @@ test('a second run gets a fresh session folder', async (t) => {
     const { agent } = makeAgent(t, [
         completion(textMessage('one')),
         completion(textMessage('two'))
-    ], { sandboxed: true });
+    ]);
 
     await agent.workspace.put('input.txt', 'first');
     const firstDir = agent.workspace.dir();
@@ -83,9 +107,9 @@ test('a second run gets a fresh session folder', async (t) => {
     assert.ok(!existsSync(secondDir));
 });
 
-test('sandboxed: <path> uses that directory as the base workspace', async (t) => {
+test('workspace: <path> uses that directory as the base workspace', async (t) => {
     const base = tempRoot(t);
-    const { agent } = makeAgent(t, [completion(textMessage('ok'))], { sandboxed: base });
+    const { agent } = makeAgent(t, [completion(textMessage('ok'))], { workspace: base });
 
     await agent.workspace.put('a.txt', 'hello');
     const dir = agent.workspace.dir();
@@ -98,7 +122,7 @@ test('sandboxed: <path> uses that directory as the base workspace', async (t) =>
 });
 
 test('put/get/getBytes/list/exists round-trip inside the session', async (t) => {
-    const { agent } = makeAgent(t, [], { sandboxed: tempRoot(t) });
+    const { agent } = makeAgent(t, [], { workspace: tempRoot(t) });
 
     await agent.workspace.put('sub/a.txt', 'hello');
     await agent.workspace.put('blob.bin', Buffer.from([1, 2, 3]));
@@ -114,7 +138,7 @@ test('put/get/getBytes/list/exists round-trip inside the session', async (t) => 
 });
 
 test('read helpers fail clearly before any session exists', async (t) => {
-    const { agent } = makeAgent(t, [], { sandboxed: tempRoot(t) });
+    const { agent } = makeAgent(t, [], { workspace: tempRoot(t) });
 
     assert.equal(agent.workspace.dir(), null);
     await assert.rejects(agent.workspace.get('a.txt'), /No session workspace is active/);
@@ -123,7 +147,7 @@ test('read helpers fail clearly before any session exists', async (t) => {
 });
 
 test('workspace helpers reject absolute paths and .. escapes', async (t) => {
-    const { agent } = makeAgent(t, [], { sandboxed: tempRoot(t) });
+    const { agent } = makeAgent(t, [], { workspace: tempRoot(t) });
 
     await assert.rejects(agent.workspace.put('/etc/passwd', 'x'), /absolute/);
     await assert.rejects(agent.workspace.put('../escape.txt', 'x'), /escapes/);
@@ -134,7 +158,7 @@ test('symlinks pointing outside the session are rejected by helpers and tools', 
     put(outside, 'secret.txt', 'top secret');
     put(outside, join('outsub', 'keep.txt'), 'y');
 
-    const { agent } = makeAgent(t, [], { sandboxed: tempRoot(t) });
+    const { agent } = makeAgent(t, [], { workspace: tempRoot(t) });
     await agent.workspace.put('a.txt', 'x'); // create the session
     const dir = agent.workspace.dir();
     symlinkSync(join(outside, 'secret.txt'), join(dir, 'file-link.txt'));
@@ -142,20 +166,28 @@ test('symlinks pointing outside the session are rejected by helpers and tools', 
 
     await assert.rejects(agent.workspace.get('file-link.txt'), /symlink/);
     await assert.rejects(agent.workspace.put('dir-link/new.txt', 'x'), /symlink/);
-    await assert.rejects(readTool({ root: dir }).execute({ path: 'file-link.txt' }), /symlink/);
+    await assert.rejects(readTool().execute({ path: 'file-link.txt' }, { workspaceDir: dir }), /symlink/);
 });
 
-test('agent.workspace is undefined without sandboxed', async (t) => {
-    const { agent } = makeAgent(t, []);
-    assert.equal(agent.workspace, undefined);
-});
-
-test('sandboxed validation and read/write name collisions', () => {
+test('workspace option validation; a same-name user tool overrides the built-in', async (t) => {
     const transport = { apiKey: 'k', model: 'm' };
-    assert.throws(() => new Agent({ transport, sandboxed: 42 }), /sandboxed must be true or a workspace directory path string/);
-    assert.throws(() => new Agent({ transport, sandboxed: '' }), /sandboxed must be true or a workspace directory path string/);
-    assert.throws(
-        () => new Agent({ transport, sandboxed: true, tools: [readTool({ root: '/tmp/rigline-x' })] }),
-        /sandboxed already registers/
-    );
+    assert.throws(() => new Agent({ transport, workspace: 42 }), /workspace must be a directory path string/);
+    assert.throws(() => new Agent({ transport, workspace: '' }), /workspace must be a directory path string/);
+
+    const mine = {
+        name: 'read',
+        description: 'host-provided read',
+        parameters: { type: 'object', properties: {}, additionalProperties: false },
+        execute: async () => 'MINE'
+    };
+    const { agent, fetchMock } = makeAgent(t, [
+        completion(toolCallsMessage([toolCall('c1', 'read', { path: 'x' })])),
+        completion(textMessage('done'))
+    ], { tools: [mine] });
+
+    const result = await agent.run('go');
+
+    const toolMsg = requestBody(fetchMock, 1).messages.find((m) => m.role === 'tool');
+    assert.equal(toolMsg.content, 'MINE', 'the user tool must win over the built-in');
+    assert.equal(result.text, 'done');
 });

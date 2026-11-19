@@ -192,8 +192,8 @@ test('webfetch runs inside an agent loop and returns converted content to the mo
     assert.equal(toolMessage.content, '## Doc');
 });
 
-test('webfetch is network-scoped, not filesystem-scoped: allowed alongside sandboxed', () => {
+test('webfetch is network-scoped, not filesystem-scoped: registers fine next to the built-in file tools', () => {
     const transport = { apiKey: 'k', model: 'm' };
-    const agent = new Agent({ transport, sandboxed: true, tools: [webfetchTool()] });
+    const agent = new Agent({ transport, tools: [webfetchTool()] });
     assert.equal(typeof agent.workspace.put, 'function');
 });

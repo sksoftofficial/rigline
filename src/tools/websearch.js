@@ -3,8 +3,8 @@
 // provider registry, forms and Tavily/Exa/... integrations are deliberately
 // not inherited). The API key is passed at construction — the host reads its
 // own env/config and injects it here; rigline never reads env itself.
-// Network-scoped like webfetch: not root-confined, NOT auto-registered by
-// `sandboxed` (hosts opt in via `tools`).
+// Network tool like webfetch: touches no filesystem, so it is NOT one of
+// the always-registered built-ins (hosts opt in via `tools`).
 
 const SEARCH_URL = 'https://api.search.brave.com/res/v1/web/search';
 const DEFAULT_COUNT = 8;

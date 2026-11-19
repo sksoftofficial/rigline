@@ -4,6 +4,8 @@ import { Agent, ApiError } from '../src/Agent.js';
 import {
     completion,
     textMessage,
+    toolCallsMessage,
+    toolCall,
     jsonResponse,
     makeAgent,
     requestUrl,
@@ -46,12 +48,17 @@ test('extra transport headers (e.g. OpenRouter attribution) are sent', async (t)
     assert.equal(headers.Authorization, 'Bearer sk-test-key');
 });
 
-test('tools are omitted from the request body when none are registered', async (t) => {
+test('the six built-in file tools are always registered and sent to the provider', async (t) => {
     const { agent, fetchMock } = makeAgent(t, [completion(textMessage('ok'))]);
 
     await agent.run('hi');
 
-    assert.equal(requestBody(fetchMock, 0).tools, undefined);
+    const body = requestBody(fetchMock, 0);
+    assert.deepEqual(
+        body.tools.map((tool) => tool.function.name),
+        ['read', 'write', 'edit', 'patch', 'glob', 'grep']
+    );
+    assert.ok(body.tools.every((tool) => tool.type === 'function'));
 });
 
 test('non-retryable 4xx fails immediately as ApiError with body attached', async (t) => {
@@ -115,16 +122,26 @@ test('constructor validates transport and options', () => {
     assert.throws(() => new Agent({ transport: { apiKey: 'k', model: 'm' }, onStep: 'nope' }), /onStep/);
 });
 
-test('registerTool validates tool shape and rejects duplicates', () => {
+test('registerTool validates tool shape; same-name registration replaces the earlier tool', async (t) => {
     const agent = new Agent({ transport: { apiKey: 'k', model: 'm' } });
     const valid = { name: 'x', description: 'd', parameters: { type: 'object' }, execute: async () => '' };
 
     agent.registerTool(valid);
-    assert.throws(() => agent.registerTool(valid), /already registered/);
+    agent.registerTool({ ...valid, execute: async () => 'second' }); // replaces, no throw
     assert.throws(() => agent.registerTool({ ...valid, name: 'bad name!' }), /tool.name/);
     assert.throws(() => agent.registerTool({ ...valid, name: 'y', description: '' }), /description/);
     assert.throws(() => agent.registerTool({ ...valid, name: 'y', parameters: null }), /parameters/);
     assert.throws(() => agent.registerTool({ ...valid, name: 'y', execute: null }), /execute/);
+
+    const { agent: runner, fetchMock } = makeAgent(t, [
+        completion(toolCallsMessage([toolCall('c1', 'x', {})])),
+        completion(textMessage('done'))
+    ], { tools: [{ ...valid, execute: async () => 'first' }] });
+    runner.registerTool({ ...valid, execute: async () => 'second' });
+    await runner.run('go');
+
+    const toolMsg = requestBody(fetchMock, 1).messages.find((m) => m.role === 'tool');
+    assert.equal(toolMsg.content, 'second');
 });
 
 test('reasoning option is sent verbatim in every request body', async (t) => {

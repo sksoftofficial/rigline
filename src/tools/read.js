@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { open, readdir, stat } from 'node:fs/promises';
-import { resolveInsideRoot, assertRealInsideRoot } from '../lib/paths.js';
+import { resolveInsideRoot, assertRealInsideRoot, sessionWorkspaceRoot } from '../lib/paths.js';
 
 // Conventions inherited from opencode's read tool: one tool for files and
 // directories, 1-based line numbers (`N: content`), offset/limit paging,
@@ -206,12 +206,7 @@ export async function listDirectory(target) {
         .map((entry) => entry.name);
 }
 
-export function readTool({ root } = {}) {
-    if (typeof root !== 'string' || root.trim().length === 0) {
-        throw new TypeError('readTool requires a root option: the base directory all reads are confined to');
-    }
-    const rootDir = path.resolve(root);
-
+export function readTool() {
     return {
         name: 'read',
         description: [
@@ -223,14 +218,15 @@ export function readTool({ root } = {}) {
         parameters: {
             type: 'object',
             properties: {
-                path: { type: 'string', description: 'File or directory to read, relative to the working root directory.' },
+                path: { type: 'string', description: 'File or directory to read, relative to the session workspace.' },
                 offset: { type: 'integer', description: 'The line or directory entry to start reading from (1-based). Negative values count back from the end of a file.' },
                 limit: { type: 'integer', description: `The maximum number of lines or directory entries to read (defaults to and capped at ${MAX_LINES}).` }
             },
             required: ['path'],
             additionalProperties: false
         },
-        execute: async (args) => {
+        execute: async (args, context) => {
+            const rootDir = sessionWorkspaceRoot(context, 'read');
             const relativePath = args?.path;
             if (args?.limit !== undefined && (!Number.isInteger(args.limit) || args.limit < 1)) {
                 throw new Error('Limit must be a positive integer');

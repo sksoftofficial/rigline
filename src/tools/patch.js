@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
-import { resolveInsideRoot, assertRealInsideRoot } from '../lib/paths.js';
+import { resolveInsideRoot, assertRealInsideRoot, sessionWorkspaceRoot } from '../lib/paths.js';
 import { unifiedDiff } from '../lib/diff.js';
 
 // Ported from opencode's patch tool (Vercel apply-patch format): one atomic
@@ -65,7 +65,13 @@ function parsePatch(patchText) {
                     if (current.lines.length > 0 || current.before !== undefined) {
                         chunks.push(current);
                     }
-                    current = { before: body === '@@' ? '' : body.slice(3), lines: [] };
+                    const before = body.slice(2).trim();
+                    if (before.length === 0) {
+                        throw new Error(
+                            `Invalid patch: '@@' anchor requires its context text on the same line (e.g. '@@ function main()') in Update File ${filePath} at line ${i + 1} — a bare '@@' would match every line and apply the chunk at the wrong offset`
+                        );
+                    }
+                    current = { before, lines: [] };
                 } else if (body.startsWith('+') || body.startsWith('-') || body.startsWith(' ')) {
                     current.lines.push(body);
                 } else if (body === '') {
@@ -97,7 +103,7 @@ function parsePatch(patchText) {
 
 function findNextLineIndex(lines, needle, from) {
     for (let i = from; i < lines.length; i += 1) {
-        if (needle === '' || lines[i].includes(needle)) {
+        if (lines[i].includes(needle)) {
             return i;
         }
     }
@@ -139,7 +145,17 @@ function deriveUpdate(relativePath, hunk, original) {
             }
             const expected = body.slice(1);
             if (lines[search] !== expected) {
-                throw new Error(`patch verification failed: line mismatch in ${relativePath}: expected ${JSON.stringify(expected)}, found ${JSON.stringify(lines[search] ?? '<end of file>')}`);
+                // A trailing newline splits into a final '' element — that is
+                // past the last real line, so report it as end of file.
+                const pastEnd = lines[search] === undefined
+                    || (search === lines.length - 1 && lines[search] === '' && original.endsWith('\n'));
+                const hint = pastEnd && chunk.before !== undefined
+                    ? `. The '@@ ${chunk.before}' anchor line is kept — body lines apply after it; to modify the context line itself, anchor on an earlier line or drop the @@ marker`
+                    : '';
+                throw new Error(
+                    `patch verification failed: line mismatch in ${relativePath}: expected ${JSON.stringify(expected)}, `
+                    + `found ${pastEnd ? '<end of file>' : JSON.stringify(lines[search])}${hint}`
+                );
             }
             if (!body.startsWith('-')) {
                 out.push(expected);
@@ -153,15 +169,10 @@ function deriveUpdate(relativePath, hunk, original) {
     return out.join('\n');
 }
 
-export function patchTool({ root } = {}) {
-    if (typeof root !== 'string' || root.trim().length === 0) {
-        throw new TypeError('patchTool requires a root option: the base directory all writes are confined to');
-    }
-    const rootDir = path.resolve(root);
-
+export function patchTool() {
     return {
         name: 'patch',
-        description: 'Use the patch tool to edit multiple files in one atomic operation. The patch language is a stripped-down, file-oriented diff format. Wrap everything in \'*** Begin Patch\' / \'*** End Patch\'. Each file section starts with one of three headers: \'*** Add File: <path>\' (create; every following line is a \'+\' line with the initial contents), \'*** Delete File: <path>\' (remove; nothing follows), or \'*** Update File: <path>\' (patch in place, optionally followed by \'*** Move to: <new path>\'). Update bodies are chunks: a \'@@ <context>\' line repositions at the next file line containing that context, then \'-\' removes the line (must match exactly), \'+\' adds a line, and a \' \' prefix verifies and keeps a line. \'*** End of File\' inside an update truncates the file at that point. The whole patch is verified against the files before anything is written — one bad line applies nothing. For single small edits prefer the edit tool.',
+        description: 'Use the patch tool to edit multiple files in one atomic operation. The patch language is a stripped-down, file-oriented diff format. Wrap everything in \'*** Begin Patch\' / \'*** End Patch\'. Each file section starts with one of three headers: \'*** Add File: <path>\' (create; every following line is a \'+\' line with the initial contents), \'*** Delete File: <path>\' (remove; nothing follows), or \'*** Update File: <path>\' (patch in place, optionally followed by \'*** Move to: <new path>\'). Update bodies are chunks: a \'@@ <context>\' line (context text on the same line — a bare \'@@\' is rejected) repositions at the next file line containing that context and KEEPS that line — the body lines apply starting at the NEXT line after it, so to modify the context line itself anchor on an earlier line. Then \'-\' removes the line (must match exactly), \'+\' adds a line, and a \' \' prefix verifies and keeps a line. \'*** End of File\' inside an update truncates the file at that point. The whole patch is verified against the files before anything is written — one bad line applies nothing. For single small edits prefer the edit tool.',
         parameters: {
             type: 'object',
             properties: {
@@ -170,7 +181,8 @@ export function patchTool({ root } = {}) {
             required: ['patchText'],
             additionalProperties: false
         },
-        execute: async (args) => {
+        execute: async (args, context) => {
+            const rootDir = sessionWorkspaceRoot(context, 'patch');
             const hunks = parsePatch(args?.patchText);
 
             // Resolve and confine every path first.

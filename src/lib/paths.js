@@ -44,3 +44,16 @@ export async function assertRealInsideRoot(rootDir, relativePath, target) {
         probe = parent;
     }
 }
+
+// The per-run session workspace root for a tool execution. The agent loop
+// always passes it as execute(args, { workspaceDir }); file tools take no root
+// at construction because the correct folder only exists once a run starts.
+export function sessionWorkspaceRoot(context, toolName) {
+    const dir = context?.workspaceDir;
+    if (typeof dir !== 'string' || dir.trim().length === 0) {
+        throw new Error(
+            `The ${toolName} tool requires an active agent session workspace (file tools run through agent.run() and never touch anything outside it)`
+        );
+    }
+    return path.resolve(dir);
+}

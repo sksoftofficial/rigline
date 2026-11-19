@@ -1,15 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Agent, MaxStepsError, JsonParseError } from '../src/Agent.js';
-import { readTool } from '../src/tools/index.js';
 import {
     completion,
     textMessage,
     toolCallsMessage,
     toolCall,
     makeAgent,
-    tempRoot,
-    put,
     requestBody
 } from './helpers.js';
 
@@ -21,19 +18,18 @@ const boomTool = {
 };
 
 test('happy path: one tool call, then final answer', async (t) => {
-    const root = tempRoot(t);
-    put(root, 'notes.txt', 'hello world');
     const { agent, fetchMock } = makeAgent(t, [
         completion(toolCallsMessage([toolCall('call_1', 'read', { path: 'notes.txt' })])),
         completion(textMessage('The file says: hello world'))
-    ], { tools: [readTool({ root })], systemPrompt: 'Be terse.' });
+    ], { systemPrompt: 'Be terse.' });
+    await agent.workspace.put('notes.txt', 'hello world');
 
     const result = await agent.run('Read notes.txt and summarize it');
 
     assert.equal(result.text, 'The file says: hello world');
     assert.equal(result.steps, 2);
     assert.equal(result.messages.length, 5); // system, user, assistant(tool_calls), tool, assistant
-    assert.deepEqual(result.usage, { promptTokens: 20, completionTokens: 10 });
+    assert.deepEqual(result.usage, { promptTokens: 20, completionTokens: 10, totalTokens: 30 });
     assert.equal(fetchMock.mock.callCount(), 2);
 
     const first = requestBody(fetchMock, 0);
@@ -51,8 +47,6 @@ test('happy path: one tool call, then final answer', async (t) => {
 });
 
 test('reasoning blocks on assistant messages are round-tripped to the next turn verbatim', async (t) => {
-    const root = tempRoot(t);
-    put(root, 'a.txt', 'AAA');
     const reasoningTurn = {
         role: 'assistant',
         content: null,
@@ -63,7 +57,8 @@ test('reasoning blocks on assistant messages are round-tripped to the next turn 
     const { agent, fetchMock } = makeAgent(t, [
         completion(reasoningTurn),
         completion(textMessage('done'))
-    ], { tools: [readTool({ root })] });
+    ]);
+    await agent.workspace.put('a.txt', 'AAA');
 
     await agent.run('read a.txt');
 
@@ -74,16 +69,15 @@ test('reasoning blocks on assistant messages are round-tripped to the next turn 
 });
 
 test('multiple tool calls in one turn all execute, in order, with matching ids', async (t) => {
-    const root = tempRoot(t);
-    put(root, 'a.txt', 'AAA');
-    put(root, 'b.txt', 'BBB');
     const { agent, fetchMock } = makeAgent(t, [
         completion(toolCallsMessage([
             toolCall('call_a', 'read', { path: 'a.txt' }),
             toolCall('call_b', 'read', { path: 'b.txt' })
         ])),
         completion(textMessage('done'))
-    ], { tools: [readTool({ root })] });
+    ]);
+    await agent.workspace.put('a.txt', 'AAA');
+    await agent.workspace.put('b.txt', 'BBB');
 
     const result = await agent.run('read both files');
 
@@ -117,7 +111,7 @@ test('unknown tools and malformed arguments become recoverable tool errors', asy
             { id: 'c2', type: 'function', function: { name: 'read', arguments: '{broken json' } }
         ])),
         completion(textMessage('fine'))
-    ], { tools: [readTool({ root: tempRoot(t) })] });
+    ]);
 
     const result = await agent.run('go');
 
@@ -183,16 +177,14 @@ test('conversation continues from a prior result.messages array, used verbatim',
 });
 
 test('onStep fires once per model turn with tool results and cumulative usage', async (t) => {
-    const root = tempRoot(t);
-    put(root, 'notes.txt', 'hello');
     const events = [];
     const { agent } = makeAgent(t, [
         completion(toolCallsMessage([toolCall('call_1', 'read', { path: 'notes.txt' })])),
         completion(textMessage('done'))
     ], {
-        tools: [readTool({ root })],
         onStep: (event) => events.push(event)
     });
+    await agent.workspace.put('notes.txt', 'hello');
 
     await agent.run('read it');
 
@@ -204,7 +196,7 @@ test('onStep fires once per model turn with tool results and cumulative usage', 
     assert.equal(events[0].toolResults[0].content, 'Read file notes.txt, lines 1-1\n1: hello');
     assert.equal(events[1].step, 2);
     assert.deepEqual(events[1].toolResults, []);
-    assert.deepEqual(events[1].usage, { promptTokens: 20, completionTokens: 10 });
+    assert.deepEqual(events[1].usage, { promptTokens: 20, completionTokens: 10, totalTokens: 30 });
 });
 
 test('run validates input', async (t) => {
@@ -220,5 +212,39 @@ test('usage.cost is passed through and summed when the provider returns it', asy
     ], { tools: [boomTool] });
 
     const result = await agent.run('go');
-    assert.deepEqual(result.usage, { promptTokens: 110, completionTokens: 55, cost: 0.03 });
+    assert.deepEqual(result.usage, { promptTokens: 110, completionTokens: 55, totalTokens: 165, cost: 0.03 });
+});
+
+test('usage tracks reasoning and cached token details when reported, absent otherwise', async (t) => {
+    const { agent } = makeAgent(t, [
+        completion(toolCallsMessage([toolCall('c1', 'boom', {})]), {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            total_tokens: 150,
+            prompt_tokens_details: { cached_tokens: 80 },
+            completion_tokens_details: { reasoning_tokens: 40 },
+            cost: 0.01
+        }),
+        // second step reports no details: totals keep deriving, detail sums stay
+        completion(textMessage('ok'), { prompt_tokens: 10, completion_tokens: 5 })
+    ], { tools: [boomTool] });
+
+    const result = await agent.run('go');
+
+    assert.deepEqual(result.usage, {
+        promptTokens: 110,
+        completionTokens: 55,
+        totalTokens: 165, // 150 reported + 15 derived (10+5)
+        reasoningTokens: 40,
+        cachedTokens: 80,
+        cost: 0.01
+    });
+
+    // a run where nothing reports details keeps the detail keys absent
+    const plain = makeAgent(t, [completion(textMessage('ok'), { prompt_tokens: 7, completion_tokens: 3, total_tokens: 10 })]);
+    assert.deepEqual((await plain.agent.run('go')).usage, {
+        promptTokens: 7,
+        completionTokens: 3,
+        totalTokens: 10
+    });
 });

@@ -51,19 +51,65 @@ function formatToolOutput(output) {
     }
 }
 
+// Usage detail readers mirror sevgili-backend's normalizeUsage ladder: the
+// plain name first, then the OpenAI/OpenRouter details objects, then the
+// Anthropic-style names. reasoning is a subset of completionTokens (billed
+// thinking); cached is a subset of promptTokens (cache hits).
+function parseTokenCount(value) {
+    const parsed = Number.parseInt(value, 10);
+    return Number.isNaN(parsed) ? null : parsed;
+}
+
+function readReasoningTokens(raw) {
+    return parseTokenCount(
+        raw.reasoning_tokens
+        ?? raw.completion_tokens_details?.reasoning_tokens
+        ?? raw.output_tokens_details?.reasoning_tokens
+    );
+}
+
+function readCachedTokens(raw) {
+    return parseTokenCount(
+        raw.cached_tokens
+        ?? raw.prompt_tokens_details?.cached_tokens
+        ?? raw.cache_read_input_tokens
+    );
+}
+
 function accumulateUsage(total, raw) {
     if (!raw || typeof raw !== 'object') {
         return;
     }
-    total.promptTokens += raw.prompt_tokens ?? 0;
-    total.completionTokens += raw.completion_tokens ?? 0;
+    const prompt = raw.prompt_tokens ?? 0;
+    const completion = raw.completion_tokens ?? 0;
+    total.promptTokens += prompt;
+    total.completionTokens += completion;
+    total.totalTokens += raw.total_tokens ?? (prompt + completion);
+    const reasoning = readReasoningTokens(raw);
+    if (reasoning !== null) {
+        total.reasoningTokens = (total.reasoningTokens ?? 0) + reasoning;
+    }
+    const cached = readCachedTokens(raw);
+    if (cached !== null) {
+        total.cachedTokens = (total.cachedTokens ?? 0) + cached;
+    }
     if (typeof raw.cost === 'number') {
         total.cost = (total.cost ?? 0) + raw.cost;
     }
 }
 
 function snapshotUsage(total) {
-    const usage = { promptTokens: total.promptTokens, completionTokens: total.completionTokens };
+    const usage = {
+        promptTokens: total.promptTokens,
+        completionTokens: total.completionTokens,
+        totalTokens: total.totalTokens
+    };
+    if (typeof total.reasoningTokens === 'number') {
+        usage.reasoningTokens = total.reasoningTokens;
+    }
+    if (typeof total.cachedTokens === 'number') {
+        usage.cachedTokens = total.cachedTokens;
+    }
     if (typeof total.cost === 'number') {
         usage.cost = total.cost;
     }
@@ -71,22 +117,22 @@ function snapshotUsage(total) {
 }
 
 export class Agent {
-    #transport;
-    #systemPrompt;
-    #maxSteps;
-    #requestTimeoutMs;
-    #reasoning;
-    #extraBody;
-    #onStep;
-    #workspace;
-    #tools = new Map();
+    _transport;
+    _systemPrompt;
+    _maxSteps;
+    _requestTimeoutMs;
+    _reasoning;
+    _extraBody;
+    _onStep;
+    _workspace;
+    _tools = new Map();
 
     constructor(options = {}) {
         const {
             transport,
             systemPrompt,
             tools,
-            sandboxed,
+            workspace,
             maxSteps = DEFAULT_MAX_STEPS,
             requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
             reasoning,
@@ -121,41 +167,43 @@ export class Agent {
         if (extraBody !== undefined && (extraBody === null || Array.isArray(extraBody) || typeof extraBody !== 'object')) {
             throw new TypeError('extraBody must be a plain object merged into each request body');
         }
-        if (sandboxed !== undefined && sandboxed !== true && (typeof sandboxed !== 'string' || sandboxed.trim().length === 0)) {
-            throw new TypeError('sandboxed must be true or a workspace directory path string');
+        if (workspace !== undefined && (typeof workspace !== 'string' || workspace.trim().length === 0)) {
+            throw new TypeError('workspace must be a directory path string: the base directory for per-run session folders');
         }
 
-        this.#transport = {
+        this._transport = {
             apiKey: transport.apiKey,
             model: transport.model,
             baseUrl: (transport.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, ''),
             headers: transport.headers ?? {}
         };
-        this.#systemPrompt = systemPrompt;
-        this.#maxSteps = maxSteps;
-        this.#requestTimeoutMs = requestTimeoutMs;
-        this.#reasoning = reasoning;
-        this.#extraBody = extraBody ?? {};
-        this.#onStep = onStep;
+        this._systemPrompt = systemPrompt;
+        this._maxSteps = maxSteps;
+        this._requestTimeoutMs = requestTimeoutMs;
+        this._reasoning = reasoning;
+        this._extraBody = extraBody ?? {};
+        this._onStep = onStep;
+
+        // Every agent gets a session workspace: a fresh session-* folder per
+        // run() under the base directory (the `workspace` option, or
+        // tmpdir()/rigline). The built-in file tools are always registered
+        // and confined to that folder — see run() for the scoping. Tools
+        // from `tools` are registered after them, so a same-name tool
+        // overrides the built-in.
+        this._workspace = new Workspace(typeof workspace === 'string' ? workspace : undefined);
+        for (const tool of [readTool(), writeTool(), editTool(), patchTool(), globTool(), grepTool()]) {
+            this.registerTool(tool);
+        }
 
         for (const tool of tools ?? []) {
             this.registerTool(tool);
         }
-
-        if (sandboxed !== undefined) {
-            for (const name of ['read', 'write', 'edit', 'patch', 'glob', 'grep']) {
-                if (this.#tools.has(name)) {
-                    throw new Error(`sandboxed already registers the built-in '${name}' tool scoped to the session workspace; do not also pass your own tools with those names`);
-                }
-            }
-            this.#workspace = new Workspace(typeof sandboxed === 'string' ? sandboxed : undefined);
-        }
     }
 
-    // Host-side helpers (put/get/getBytes/list/exists/dir) for the sandbox
-    // session workspace; undefined unless the agent was built with `sandboxed`.
+    // Host-side helpers (put/get/getBytes/list/exists/dir) for the current
+    // session workspace; every agent has one.
     get workspace() {
-        return this.#workspace?.api;
+        return this._workspace.api;
     }
 
     registerTool(tool) {
@@ -174,10 +222,9 @@ export class Agent {
         if (typeof tool.execute !== 'function') {
             throw new TypeError(`tool.execute must be a function, for tool '${tool.name}'`);
         }
-        if (this.#tools.has(tool.name)) {
-            throw new Error(`Tool already registered: '${tool.name}'`);
-        }
-        this.#tools.set(tool.name, {
+        // Same-name registration replaces the existing tool — the built-in file
+        // tools included, when a host wants its own behavior under that name.
+        this._tools.set(tool.name, {
             name: tool.name,
             description: tool.description,
             parameters: tool.parameters,
@@ -187,29 +234,24 @@ export class Agent {
 
     // input: prompt string (systemPrompt is prepended) OR a messages array,
     // used verbatim — this is how a conversation continues via result.messages.
-    // With `sandboxed`, each call is one session: a fresh session-* folder the
-    // built-in tools are scoped to, removed just before the run settles.
+    // Each run() is one session: a fresh session-* folder under the workspace
+    // base, handed to every tool execution as execute(args, { workspaceDir })
+    // so the built-in file tools (and any host tool that touches the
+    // filesystem) are confined to it. Removed just before the run settles.
     async run(input) {
-        const messages = this.#buildMessages(input);
-        const session = this.#workspace?.startSession();
-        if (session) {
-            this.#tools.set('read', readTool({ root: session.dir }));
-            this.#tools.set('write', writeTool({ root: session.dir }));
-            this.#tools.set('edit', editTool({ root: session.dir }));
-            this.#tools.set('patch', patchTool({ root: session.dir }));
-            this.#tools.set('glob', globTool({ root: session.dir }));
-            this.#tools.set('grep', grepTool({ root: session.dir }));
-        }
+        const messages = this._buildMessages(input);
+        const session = this._workspace.startSession();
+        const toolContext = { workspaceDir: session.dir };
         let steps = 0;
-        const totalUsage = { promptTokens: 0, completionTokens: 0, cost: undefined };
+        const totalUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0, cost: undefined };
 
         try {
             for (;;) {
-                if (steps >= this.#maxSteps) {
-                    throw new MaxStepsError(this.#maxSteps, messages);
+                if (steps >= this._maxSteps) {
+                    throw new MaxStepsError(this._maxSteps, messages);
                 }
 
-                const data = await this.#request(messages);
+                const data = await this._request(messages);
                 accumulateUsage(totalUsage, data.usage);
                 steps += 1;
 
@@ -230,17 +272,17 @@ export class Agent {
                         steps,
                         usage
                     };
-                    this.#onStep?.({ step: steps, message, toolResults: [], usage });
+                    this._onStep?.({ step: steps, message, toolResults: [], usage });
                     return result;
                 }
 
                 const toolResults = [];
                 for (const call of toolCalls) {
-                    const content = await this.#executeToolCall(call);
+                    const content = await this._executeToolCall(call, toolContext);
                     toolResults.push({ toolCallId: call?.id, name: call?.function?.name, content });
                     messages.push({ role: 'tool', tool_call_id: call?.id, content });
                 }
-                this.#onStep?.({ step: steps, message, toolResults, usage: snapshotUsage(totalUsage) });
+                this._onStep?.({ step: steps, message, toolResults, usage: snapshotUsage(totalUsage) });
             }
         } finally {
             await session?.end();
@@ -260,7 +302,7 @@ export class Agent {
         }
     }
 
-    #buildMessages(input) {
+    _buildMessages(input) {
         if (Array.isArray(input)) {
             if (input.length === 0) {
                 throw new TypeError('run() messages array must not be empty');
@@ -271,8 +313,8 @@ export class Agent {
             throw new TypeError('run() input must be a prompt string or a messages array');
         }
         const messages = [];
-        if (this.#systemPrompt) {
-            messages.push({ role: 'system', content: this.#systemPrompt });
+        if (this._systemPrompt) {
+            messages.push({ role: 'system', content: this._systemPrompt });
         }
         messages.push({ role: 'user', content: input });
         return messages;
@@ -280,10 +322,10 @@ export class Agent {
 
     // A throwing execute (or unknown tool, or malformed arguments) never aborts
     // the run: the message goes back to the model as `Error: <message>`.
-    async #executeToolCall(call) {
+    async _executeToolCall(call, context) {
         const name = call?.function?.name;
         try {
-            const tool = this.#tools.get(name);
+            const tool = this._tools.get(name);
             if (!tool) {
                 throw new Error(`Unknown tool '${name}'`);
             }
@@ -293,18 +335,18 @@ export class Agent {
             } catch {
                 throw new Error(`Invalid JSON arguments for tool '${name}': ${call.function.arguments}`);
             }
-            const output = await tool.execute(args);
+            const output = await tool.execute(args, context);
             return formatToolOutput(output);
         } catch (err) {
             return `Error: ${err instanceof Error ? err.message : String(err)}`;
         }
     }
 
-    async #request(messages) {
-        const url = `${this.#transport.baseUrl}/chat/completions`;
-        const body = { model: this.#transport.model, messages, stream: false };
-        if (this.#tools.size > 0) {
-            body.tools = [...this.#tools.values()].map((tool) => ({
+    async _request(messages) {
+        const url = `${this._transport.baseUrl}/chat/completions`;
+        const body = { model: this._transport.model, messages, stream: false };
+        if (this._tools.size > 0) {
+            body.tools = [...this._tools.values()].map((tool) => ({
                 type: 'function',
                 function: {
                     name: tool.name,
@@ -313,30 +355,30 @@ export class Agent {
                 }
             }));
         }
-        if (this.#reasoning !== undefined) {
-            body.reasoning = this.#reasoning;
+        if (this._reasoning !== undefined) {
+            body.reasoning = this._reasoning;
         }
         // extraBody is merged last and can override anything above it.
-        Object.assign(body, this.#extraBody);
+        Object.assign(body, this._extraBody);
 
         // One AbortController per logical request; the timeout spans all retry attempts.
         const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), this.#requestTimeoutMs);
+        const timer = setTimeout(() => controller.abort(), this._requestTimeoutMs);
         let response;
         try {
             response = await fetchWithRetry(url, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
-                    Authorization: `Bearer ${this.#transport.apiKey}`,
-                    ...this.#transport.headers
+                    Authorization: `Bearer ${this._transport.apiKey}`,
+                    ...this._transport.headers
                 },
                 body: JSON.stringify(body),
                 signal: controller.signal
             }, { maxAttempts: RETRY_MAX_ATTEMPTS });
         } catch (err) {
             if (err?.name === 'AbortError') {
-                throw new Error(`Provider request timed out after ${this.#requestTimeoutMs}ms (POST ${url})`, { cause: err });
+                throw new Error(`Provider request timed out after ${this._requestTimeoutMs}ms (POST ${url})`, { cause: err });
             }
             throw err;
         } finally {

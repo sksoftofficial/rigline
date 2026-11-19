@@ -1,8 +1,8 @@
 // Ported from opencode's webfetch tool: fetch an HTTP(S) URL and return it
 // as markdown (default), text, or HTML. Redirects are followed manually so
 // every hop is re-validated; the body is capped in memory; only textual
-// content types are accepted. Not root-confined — it is a network tool, so
-// it is NOT auto-registered by `sandboxed` (hosts opt in explicitly).
+// content types are accepted. Network tool — touches no filesystem, so it
+// is NOT one of the always-registered built-ins (hosts opt in via `tools`).
 
 import { convertHTMLToMarkdown, extractTextFromHTML } from '../lib/html-to-markdown.js';
 

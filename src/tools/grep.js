@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { readFile, stat } from 'node:fs/promises';
-import { resolveInsideRoot, assertRealInsideRoot } from '../lib/paths.js';
+import { resolveInsideRoot, assertRealInsideRoot, sessionWorkspaceRoot } from '../lib/paths.js';
 import { walkFiles } from '../lib/fs-walk.js';
 import { globMatches } from '../lib/glob.js';
 
@@ -17,12 +17,7 @@ function escapeRegex(value) {
     return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-export function grepTool({ root } = {}) {
-    if (typeof root !== 'string' || root.trim().length === 0) {
-        throw new TypeError('grepTool requires a root option: the base directory all searches are confined to');
-    }
-    const rootDir = path.resolve(root);
-
+export function grepTool() {
     return {
         name: 'grep',
         description: 'Search file contents using a regular expression or literal text. Matches are grouped by file and shown as "  Line N: text". Use include to filter files by glob (for example, "*.js" or "*.{ts,tsx}"). Hidden files and directories are not searched; binary files are skipped.',
@@ -30,7 +25,7 @@ export function grepTool({ root } = {}) {
             type: 'object',
             properties: {
                 pattern: { type: 'string', description: 'Regular expression or literal text to match in file contents.' },
-                path: { type: 'string', description: 'File or directory to search. Defaults to the working root directory.' },
+                path: { type: 'string', description: 'File or directory to search. Defaults to the session workspace.' },
                 include: { type: 'string', description: 'Glob pattern to filter files (for example, "*.js" or "*.{ts,tsx}").' },
                 literal: { type: 'boolean', description: 'Treat `pattern` as exact text instead of a regular expression (default: false).' },
                 caseSensitive: { type: 'boolean', description: 'Use case-sensitive matching (default: true).' },
@@ -39,7 +34,8 @@ export function grepTool({ root } = {}) {
             required: ['pattern'],
             additionalProperties: false
         },
-        execute: async (args) => {
+        execute: async (args, context) => {
+            const rootDir = sessionWorkspaceRoot(context, 'grep');
             if (typeof args?.pattern !== 'string' || args.pattern.length === 0) {
                 throw new Error('pattern must be a non-empty string');
             }
