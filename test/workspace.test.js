@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, symlinkSync } from 'node:fs';
+import { existsSync, readdirSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Agent, MaxStepsError } from '../src/Agent.js';
@@ -190,4 +190,97 @@ test('workspace option validation; a same-name user tool overrides the built-in'
     const toolMsg = requestBody(fetchMock, 1).messages.find((m) => m.role === 'tool');
     assert.equal(toolMsg.content, 'MINE', 'the user tool must win over the built-in');
     assert.equal(result.text, 'done');
+});
+
+test('a run that never touches files creates no directories at all — not even the base', async (t) => {
+    const base = join(tempRoot(t), 'never-created');
+    const { agent } = makeAgent(t, [completion(textMessage('done'))], { workspace: base });
+
+    assert.ok(!existsSync(base), 'the constructor must not create the base directory');
+    await agent.run('go');
+
+    assert.ok(!existsSync(base), 'a file-free run must not create the base or any session folder');
+});
+
+test('the session folder materializes on the first file-tool execution mid-run', async (t) => {
+    const base = join(tempRoot(t), 'lazy-base');
+    const { agent } = makeAgent(t, [
+        completion(toolCallsMessage([toolCall('c1', 'write', { path: 'out.txt', content: 'x' })])),
+        completion(textMessage('done'))
+    ], { workspace: base });
+
+    await agent.run('go');
+
+    assert.ok(existsSync(base), 'the base directory is created once a file tool runs');
+    assert.deepEqual(readdirSync(base), [], 'the session folder must be removed when the run settles');
+});
+
+test('dir() materializes the session when called while a run is in flight', async (t) => {
+    const base = join(tempRoot(t), 'onstep-base');
+    let seenDir = null;
+    const { agent } = makeAgent(t, [completion(textMessage('done'))], {
+        workspace: base,
+        onStep: () => {
+            seenDir = agent.workspace.dir();
+        }
+    });
+
+    await agent.run('go');
+
+    assert.ok(typeof seenDir === 'string' && seenDir.includes('session-'), `dir() mid-run must return a real folder, got: ${seenDir}`);
+    assert.deepEqual(readdirSync(base), [], 'the materialized folder is still cleaned up');
+});
+
+test('workspace: false — no file tools registered, no workspace helpers, workspaceDir is null', async (t) => {
+    const echo = {
+        name: 'echo',
+        description: 'echoes text and its workspaceDir',
+        parameters: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'], additionalProperties: false },
+        execute: async ({ text }, context) => `${text}|${context?.workspaceDir ?? 'null'}`
+    };
+    const { agent, fetchMock } = makeAgent(t, [
+        completion(toolCallsMessage([toolCall('c1', 'echo', { text: 'hi' })])),
+        completion(textMessage('done'))
+    ], { workspace: false, tools: [echo] });
+
+    assert.throws(() => agent.workspace, /This agent has no workspace \(workspace: false\)/);
+
+    const result = await agent.run('go');
+
+    assert.deepEqual(requestBody(fetchMock, 0).tools.map((tool) => tool.function.name), ['echo'],
+        'the six built-in file tools must not be registered or sent to the provider');
+    const toolMsg = requestBody(fetchMock, 1).messages.find((m) => m.role === 'tool');
+    assert.equal(toolMsg.content, 'hi|null');
+    assert.equal(result.text, 'done');
+});
+
+test('workspace: false with no tools sends no tools array at all', async (t) => {
+    const { agent, fetchMock } = makeAgent(t, [completion(textMessage('done'))], { workspace: false });
+
+    await agent.run('go');
+
+    assert.equal(requestBody(fetchMock, 0).tools, undefined);
+});
+
+test('requiresWorkspace: enforced as a boolean, and rejected on workspace: false agents', async (t) => {
+    const transport = { apiKey: 'k', model: 'm' };
+    const agent = new Agent({ transport, workspace: false });
+
+    assert.throws(() => agent.registerTool(readTool()), /requires a session workspace, but this agent was built with workspace: false/);
+    assert.throws(() => new Agent({
+        transport,
+        workspace: false,
+        tools: [{ name: 'x', description: 'x', parameters: { type: 'object' }, execute: async () => 1, requiresWorkspace: 'yes' }]
+    }), /tool.requiresWorkspace must be a boolean, for tool 'x'/);
+
+    const enabled = new Agent({ transport });
+    enabled.registerTool(readTool()); // same-name re-registration on a workspace-enabled agent is fine
+});
+
+test('one run() at a time holds with workspace: false too', async (t) => {
+    const { agent } = makeAgent(t, [completion(textMessage('a')), completion(textMessage('b'))], { workspace: false });
+
+    const first = agent.run('one');
+    await assert.rejects(agent.run('two'), /one run\(\) at a time per Agent/);
+    assert.equal((await first).text, 'a');
 });

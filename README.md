@@ -6,7 +6,8 @@ in-process by your worker code. A **library** — no CLI, no server, no config f
 - Zero runtime dependencies (global `fetch` + `node:` builtins), ESM only, Node.js >= 20.
 - OpenAI-compatible transport, OpenRouter by default; any compatible host via `baseUrl`.
 - You own the domain: built-ins are the file toolkit (`read` / `write` / `edit` / `patch` / `glob` / `grep`)
-  — always registered, sandboxed to a per-run session workspace — plus opt-in `webfetch` / `websearch`,
+  — registered on every workspace-enabled agent, sandboxed to a per-run session workspace — plus opt-in
+  `webfetch` / `websearch`,
   conventions inherited from [opencode](https://github.com/sst/opencode); everything else is registered by the host.
 
 ## Install
@@ -41,8 +42,8 @@ await agent.workspace.put('notes.txt', notes);    // stage files into this run's
 
 const result = await agent.run('Read notes.txt and draft a headline into draft.md');
 // result: { text, messages, steps, usage: { promptTokens, completionTokens, totalTokens, reasoningTokens?, cachedTokens?, cost? } }
-// read/write/edit/patch/glob/grep are always registered — confined to the
-// per-run session folder, cleaned up when the run settles.
+// read/write/edit/patch/glob/grep are registered by default — confined to the
+// per-run session folder, created lazily, cleaned up when the run settles.
 ```
 
 ## Custom tools
@@ -87,7 +88,7 @@ const next = await agent.run([...result.messages, { role: 'user', content: 'Now 
 | `transport.headers` | object | `{}` | extra headers, merged after the standard ones (can override) |
 | `systemPrompt` | string | — | prepended as `role: 'system'` for string prompts |
 | `tools` | array | `[]` | tool objects, same shape as `registerTool` |
-| `workspace` | string | `tmpdir()/rigline` | base directory for the per-run `session-*` folders every agent gets. The six built-in file tools are **always** registered and confined to the session folder. See [Workspace](#workspace) |
+| `workspace` | string \| false | `tmpdir()/rigline` | base directory for the per-run `session-*` folders. The six built-in file tools are registered and confined to the session folder; both are created **lazily**, so a run that never touches files does zero filesystem IO. `false` disables all of it — no folders, no file tools sent to the provider, `agent.workspace` throws. See [Workspace](#workspace) |
 | `maxSteps` | number | `24` | max model round-trips per `run()` |
 | `requestTimeoutMs` | number | `120000` | covers the whole request incl. retries; aborts on expiry |
 | `reasoning` | object | — | sent verbatim as the request's `reasoning` param, e.g. `{ enabled: true, max_tokens: 128 }`; see below |
@@ -101,7 +102,8 @@ const next = await agent.run([...result.messages, { role: 'user', content: 'Now 
 | `name` | must match `/^[a-zA-Z0-9_-]{1,64}$/`; same-name registration **replaces** the existing tool (built-ins included) |
 | `description` | what the model sees |
 | `parameters` | JSON Schema object (`{ type: 'object', properties, required }`) |
-| `execute` | `async (args, { workspaceDir }) => result` — the session workspace folder, when a run is in flight; throw = recoverable tool error |
+| `execute` | `async (args, { workspaceDir }) => result` — the session workspace folder, when a run is in flight (`null` on a `workspace: false` agent); throw = recoverable tool error |
+| `requiresWorkspace` | optional boolean (default `false`): declare that `execute` needs `workspaceDir`; registering such a tool on a `workspace: false` agent throws at registration instead of failing mid-run |
 
 ### `agent.run(input)` → `Promise<{ text, messages, steps, usage }>`
 
@@ -150,8 +152,9 @@ webfetchTool();                // webfetch({ url, format?, timeout? }) -> fetch 
 websearchTool({ apiKey });     // websearch({ query }) -> Brave Search results as markdown
 ```
 
-The six file tools take **no options**: every agent already registers them, scoped to
-its per-run session workspace (see [Workspace](#workspace)). Importing them is only
+The six file tools take **no options**: every workspace-enabled agent already registers
+them, scoped to its per-run session workspace (see [Workspace](#workspace)); none are
+registered when `workspace: false`. Importing them is only
 needed for standalone use. `webfetch`/`websearch` are network tools — opt in via `tools`.
 
 Conventions inherited from [opencode](https://github.com/sst/opencode)'s toolset.
@@ -262,7 +265,7 @@ markdown converter (no htmlparser2, no turndown):
   the default `Rigline-User` agent.
 
 `webfetch` is network-scoped, not filesystem-scoped: it touches no files and is
-**not** one of the always-registered built-ins — add it via `tools` if you want it.
+**not** one of the auto-registered built-ins — add it via `tools` if you want it.
 Errors read `Unable to fetch <url>: <reason>`
 (`response status 404`, `request timed out after 30s`, ...). SSRF posture is
 the host's call: wrap `execute` or don't register the tool for untrusted
@@ -300,7 +303,7 @@ const agent = new Agent({
 - Descriptions are requested undecorated (`text_decorations=false`) so no
   `<strong>` highlight markup leaks into the markdown.
 - Network-scoped like `webfetch`: touches no filesystem, not one of the
-  always-registered built-ins — opt in via `tools`.
+  auto-registered built-ins — opt in via `tools`.
 
 ### All built-in file tools
 
@@ -313,10 +316,12 @@ const agent = new Agent({
 
 ## Workspace
 
-Every agent — no opt-in — gives each `run()` its own `session-*` folder under a shared
-base directory (the `workspace` option, default `tmpdir()/rigline` on Linux
-`/tmp/rigline`). The six built-in file tools are always registered and can only touch
-that folder; nothing else on disk is reachable through them:
+Every workspace-enabled agent gives each `run()` its own `session-*` folder under a
+shared base directory (the `workspace` option, default `tmpdir()/rigline` on Linux
+`/tmp/rigline`). The six built-in file tools are registered and can only touch that
+folder; nothing else on disk is reachable through them. Nothing is created up front —
+the base directory and each session folder materialize on first use, so a run that
+never touches files does zero filesystem IO:
 
 ```js
 const agent = new Agent({
@@ -334,7 +339,9 @@ const result = await agent.run('process input.txt');
 Lifecycle — each `run()` call is one session:
 
 - A fresh `session-*` folder is created under the base, lazily: when you stage files
-  via `put()`, otherwise at run start.
+  via `put()`, or mid-run when a file tool first executes (or you call `dir()` while
+  the run is in flight). A run that never touches files creates nothing at all — not
+  even the base directory.
 - File tools receive the session folder at execution time — they never take a root at
   construction, so the correct folder always matches the run in flight. Custom tools
   get it too, as `execute(args, { workspaceDir })` — **any** tool that touches the
@@ -345,12 +352,20 @@ Lifecycle — each `run()` call is one session:
 - When the run settles — final answer, `MaxStepsError`, or any failure — the session
   folder is removed (best-effort) before control returns. The base directory stays.
 
+**`workspace: false`** opts out entirely, for agents with no use for a filesystem —
+high-throughput hosts routing hundreds of requests per second, pure tool-routing
+workloads. The agent then never issues a single filesystem syscall: no base directory,
+no session folders, the six file tools are neither registered nor sent to the provider
+(less prompt overhead per request), and `agent.workspace` throws. Host tools that
+declare `requiresWorkspace: true` are rejected at `registerTool` time with a clear
+error instead of failing mid-run.
+
 `agent.workspace` — host-side helpers with the same confinement, so your app never
 does raw `fs` against the session:
 
 | helper | notes |
 | --- | --- |
-| `dir()` | absolute session folder path, or `null` before one exists |
+| `dir()` | absolute session folder path, or `null` before one exists; while a run is in flight it creates the folder on demand |
 | `put(relPath, content)` | string or Buffer; creates parent dirs; creates the session lazily |
 | `get(relPath)` / `getBytes(relPath)` | utf8 string / Buffer |
 | `list(relPath?)` | entries, directories first with trailing `/` |
@@ -365,7 +380,8 @@ Limits worth knowing:
 - Built-in tools are confined by construction; custom tools you register are host
   code — keep any that touch the filesystem inside `workspaceDir` from their execute
   context.
-- An agent runs **one `run()` at a time** — the session is per run.
+- An agent runs **one `run()` at a time** — the session is per run (holds for
+  `workspace: false` agents too).
 - Symlink checks race nothing in practice but are verified once before each IO; a
   symlink swapped in between check and IO can still escape (TOCTOU, best-effort).
 

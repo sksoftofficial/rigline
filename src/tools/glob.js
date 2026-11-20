@@ -15,6 +15,7 @@ const TRUNCATION_NOTE = (count) => `(Results are truncated: showing first ${coun
 export function globTool() {
     return {
         name: 'glob',
+        requiresWorkspace: true,
         description: 'Search file paths using a glob pattern (examples: "**/*.ts", "src/**/*.md", "**/*.{json,md}"). Returns matching file paths, one per line, when you need to find files by name or extension. Hidden files (dot-prefixed) are skipped unless hidden is true.',
         parameters: {
             type: 'object',

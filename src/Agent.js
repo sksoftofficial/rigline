@@ -126,6 +126,7 @@ export class Agent {
     _onStep;
     _workspace;
     _tools = new Map();
+    _runInFlight = false;
 
     constructor(options = {}) {
         const {
@@ -167,8 +168,8 @@ export class Agent {
         if (extraBody !== undefined && (extraBody === null || Array.isArray(extraBody) || typeof extraBody !== 'object')) {
             throw new TypeError('extraBody must be a plain object merged into each request body');
         }
-        if (workspace !== undefined && (typeof workspace !== 'string' || workspace.trim().length === 0)) {
-            throw new TypeError('workspace must be a directory path string: the base directory for per-run session folders');
+        if (workspace !== undefined && workspace !== false && (typeof workspace !== 'string' || workspace.trim().length === 0)) {
+            throw new TypeError('workspace must be a directory path string, or false to disable session workspaces entirely');
         }
 
         this._transport = {
@@ -184,15 +185,20 @@ export class Agent {
         this._extraBody = extraBody ?? {};
         this._onStep = onStep;
 
-        // Every agent gets a session workspace: a fresh session-* folder per
-        // run() under the base directory (the `workspace` option, or
-        // tmpdir()/rigline). The built-in file tools are always registered
-        // and confined to that folder — see run() for the scoping. Tools
-        // from `tools` are registered after them, so a same-name tool
-        // overrides the built-in.
-        this._workspace = new Workspace(typeof workspace === 'string' ? workspace : undefined);
-        for (const tool of [readTool(), writeTool(), editTool(), patchTool(), globTool(), grepTool()]) {
-            this.registerTool(tool);
+        // workspace: false turns the session workspace off entirely: no
+        // directory is ever created, no agent.workspace helpers, and the
+        // built-in file tools are not registered (registerTool also rejects
+        // host tools that declare requiresWorkspace: true). Otherwise every
+        // agent gets a session workspace: a fresh session-* folder per run()
+        // under the base directory (the `workspace` option, or
+        // tmpdir()/rigline), materialized lazily on first use — see run().
+        // Tools from `tools` are registered after the built-ins, so a
+        // same-name tool overrides the built-in.
+        this._workspace = workspace === false ? null : new Workspace(typeof workspace === 'string' ? workspace : undefined);
+        if (this._workspace !== null) {
+            for (const tool of [readTool(), writeTool(), editTool(), patchTool(), globTool(), grepTool()]) {
+                this.registerTool(tool);
+            }
         }
 
         for (const tool of tools ?? []) {
@@ -201,8 +207,11 @@ export class Agent {
     }
 
     // Host-side helpers (put/get/getBytes/list/exists/dir) for the current
-    // session workspace; every agent has one.
+    // session workspace; every agent with a workspace has one.
     get workspace() {
+        if (this._workspace === null) {
+            throw new Error('This agent has no workspace (workspace: false): pass a base directory path — or omit the option — to get session workspaces back');
+        }
         return this._workspace.api;
     }
 
@@ -222,6 +231,14 @@ export class Agent {
         if (typeof tool.execute !== 'function') {
             throw new TypeError(`tool.execute must be a function, for tool '${tool.name}'`);
         }
+        if (tool.requiresWorkspace !== undefined && typeof tool.requiresWorkspace !== 'boolean') {
+            throw new TypeError(`tool.requiresWorkspace must be a boolean, for tool '${tool.name}'`);
+        }
+        // Fail fast at registration instead of mid-run: a tool that declares
+        // it needs the session workspace cannot work on a workspace-less agent.
+        if (tool.requiresWorkspace === true && this._workspace === null) {
+            throw new TypeError(`tool '${tool.name}' requires a session workspace, but this agent was built with workspace: false`);
+        }
         // Same-name registration replaces the existing tool — the built-in file
         // tools included, when a host wants its own behavior under that name.
         this._tools.set(tool.name, {
@@ -234,18 +251,28 @@ export class Agent {
 
     // input: prompt string (systemPrompt is prepended) OR a messages array,
     // used verbatim — this is how a conversation continues via result.messages.
-    // Each run() is one session: a fresh session-* folder under the workspace
-    // base, handed to every tool execution as execute(args, { workspaceDir })
-    // so the built-in file tools (and any host tool that touches the
-    // filesystem) are confined to it. Removed just before the run settles.
+    // Each run() is one session: a session-* folder under the workspace base,
+    // handed to every tool execution as execute(args, { workspaceDir }) so the
+    // built-in file tools (and any host tool that touches the filesystem) are
+    // confined to it. The folder is created lazily — workspaceDir is a getter,
+    // so it only materializes when a tool actually reads it (a file tool about
+    // to do IO) — and is removed just before the run settles. With
+    // workspace: false there is no session at all and workspaceDir is null.
     async run(input) {
+        if (this._runInFlight) {
+            throw new Error('This agent already has a run() in flight; one run() at a time per Agent');
+        }
         const messages = this._buildMessages(input);
-        const session = this._workspace.startSession();
-        const toolContext = { workspaceDir: session.dir };
-        let steps = 0;
-        const totalUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0, cost: undefined };
-
+        this._runInFlight = true;
+        let session;
         try {
+            session = this._workspace?.startSession();
+            const toolContext = session === undefined
+                ? { workspaceDir: null }
+                : { get workspaceDir() { return session.dir; } };
+            let steps = 0;
+            const totalUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0, cost: undefined };
+
             for (;;) {
                 if (steps >= this._maxSteps) {
                     throw new MaxStepsError(this._maxSteps, messages);
@@ -285,6 +312,7 @@ export class Agent {
                 this._onStep?.({ step: steps, message, toolResults, usage: snapshotUsage(totalUsage) });
             }
         } finally {
+            this._runInFlight = false;
             await session?.end();
         }
     }

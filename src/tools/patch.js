@@ -172,6 +172,7 @@ function deriveUpdate(relativePath, hunk, original) {
 export function patchTool() {
     return {
         name: 'patch',
+        requiresWorkspace: true,
         description: 'Use the patch tool to edit multiple files in one atomic operation. The patch language is a stripped-down, file-oriented diff format. Wrap everything in \'*** Begin Patch\' / \'*** End Patch\'. Each file section starts with one of three headers: \'*** Add File: <path>\' (create; every following line is a \'+\' line with the initial contents), \'*** Delete File: <path>\' (remove; nothing follows), or \'*** Update File: <path>\' (patch in place, optionally followed by \'*** Move to: <new path>\'). Update bodies are chunks: a \'@@ <context>\' line (context text on the same line — a bare \'@@\' is rejected) repositions at the next file line containing that context and KEEPS that line — the body lines apply starting at the NEXT line after it, so to modify the context line itself anchor on an earlier line. Then \'-\' removes the line (must match exactly), \'+\' adds a line, and a \' \' prefix verifies and keeps a line. \'*** End of File\' inside an update truncates the file at that point. The whole patch is verified against the files before anything is written — one bad line applies nothing. For single small edits prefer the edit tool.',
         parameters: {
             type: 'object',

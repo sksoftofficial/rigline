@@ -209,6 +209,7 @@ export async function listDirectory(target) {
 export function readTool() {
     return {
         name: 'read',
+        requiresWorkspace: true,
         description: [
             'Read the contents of a file or directory.',
             'Each text line is prefixed by its 1-based line number as <line>: <content>. The prefix is for reference and is not part of the file content.',

@@ -7,8 +7,11 @@ import { listDirectory } from './tools/read.js';
 
 // Session-scoped sandbox workspace. The base directory is shared and
 // persistent (the Agent `workspace` option, or tmpdir()/rigline by default);
-// every run() gets its own session-* subfolder, created lazily — the host
-// staging files via put(), or at run start — and removed when the run
+// every run() gets its own session-* subfolder. Nothing touches the disk up
+// front: the base and the session folder materialize lazily on first real
+// use — the host staging files via put(), a file tool executing mid-run, or
+// dir() while a run is in flight — so a run that never touches files pays
+// zero filesystem syscalls. The session folder is removed when the run
 // settles: final answer, MaxStepsError, or any other failure, always before
 // returning to the host.
 export class Workspace {
@@ -18,13 +21,15 @@ export class Workspace {
 
     constructor(baseDir) {
         this._base = path.resolve(baseDir ?? path.join(tmpdir(), 'rigline'));
-        mkdirSync(this._base, { recursive: true });
     }
 
-    // The host-facing helper surface, exposed as agent.workspace.
+    // The host-facing helper surface, exposed as agent.workspace. dir() is a
+    // pure read outside a run (null until something stages a session); while
+    // a run is in flight it materializes the session, matching the guarantee
+    // it always gave: a real folder whenever a run is on.
     get api() {
         return {
-            dir: () => this._session,
+            dir: () => (this._running && this._session === null ? this._ensureSession() : this._session),
             put: (relativePath, content) => this._put(relativePath, content),
             get: (relativePath) => this._get(relativePath, 'utf8'),
             getBytes: (relativePath) => this._get(relativePath),
@@ -34,25 +39,41 @@ export class Workspace {
     }
 
     // Called at the top of Agent.run(): adopts the session the host staged
-    // into (if any) or creates a fresh one. `end()` removes the session
-    // folder; the base directory always stays.
+    // into (if any) and marks the run window. Creates nothing — the session
+    // folder materializes on first use via the dir getter (how tools reach
+    // it) or put(). `end()` removes the session folder if it ever
+    // materialized; the base directory always stays.
     startSession() {
         if (this._running) {
             throw new Error('This agent already has a run() in flight; workspace sessions run one at a time');
         }
-        if (this._session === null) {
-            this._session = mkdtempSync(path.join(this._base, 'session-'));
-        }
         this._running = true;
-        const dir = this._session;
+        const ws = this;
         return {
-            dir,
+            get dir() {
+                return ws._ensureSession();
+            },
             end: async () => {
-                this._running = false;
-                this._session = null;
-                await rm(dir, { recursive: true, force: true }).catch(() => {});
+                ws._running = false;
+                const dir = ws._session;
+                ws._session = null;
+                if (dir !== null) {
+                    await rm(dir, { recursive: true, force: true }).catch(() => {});
+                }
             }
         };
+    }
+
+    // Materializes the session folder (and the base directory) on demand.
+    // Sync on purpose: dir() and the tool-execution context hand out the
+    // folder as a plain string, and this only ever runs right before real IO
+    // inside that folder anyway.
+    _ensureSession() {
+        if (this._session === null) {
+            mkdirSync(this._base, { recursive: true });
+            this._session = mkdtempSync(path.join(this._base, 'session-'));
+        }
+        return this._session;
     }
 
     // All helpers resolve inside the current session folder. put() creates
@@ -62,7 +83,7 @@ export class Workspace {
             if (!create) {
                 throw new Error('No session workspace is active: it exists after agent.workspace.put() or while a run() is in flight');
             }
-            this._session = mkdtempSync(path.join(this._base, 'session-'));
+            this._ensureSession();
         }
         const target = resolveInsideRoot(this._session, relativePath);
         await assertRealInsideRoot(this._session, relativePath, target);

@@ -8,6 +8,7 @@ import { resolveInsideRoot, assertRealInsideRoot, sessionWorkspaceRoot } from '.
 export function writeTool() {
     return {
         name: 'write',
+        requiresWorkspace: true,
         description: 'Writes a file to the local filesystem, overwriting if one exists. Missing parent directories are created automatically. Use this tool to create new files or overwrite existing files. For partial changes, use the edit tool instead.',
         parameters: {
             type: 'object',

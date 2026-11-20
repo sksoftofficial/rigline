@@ -20,6 +20,7 @@ function escapeRegex(value) {
 export function grepTool() {
     return {
         name: 'grep',
+        requiresWorkspace: true,
         description: 'Search file contents using a regular expression or literal text. Matches are grouped by file and shown as "  Line N: text". Use include to filter files by glob (for example, "*.js" or "*.{ts,tsx}"). Hidden files and directories are not searched; binary files are skipped.',
         parameters: {
             type: 'object',
