@@ -46,6 +46,54 @@ test('happy path: one tool call, then final answer', async (t) => {
     assert.equal(toolMsg.content, 'Read file notes.txt, lines 1-1\n1: hello world');
 });
 
+test('run() surfaces final-round-trip response metadata: id, model, finishReason, nativeFinishReason', async (t) => {
+    const finalBody = {
+        id: 'cmpl-meta',
+        model: 'provider/served-model',
+        object: 'chat.completion',
+        choices: [{
+            index: 0,
+            message: textMessage('done'),
+            finish_reason: 'content_filter',
+            native_finish_reason: 'content_filter'
+        }],
+        usage: { prompt_tokens: 7, completion_tokens: 3 }
+    };
+    const { agent } = makeAgent(t, [finalBody]);
+
+    const result = await agent.run('hi');
+
+    assert.equal(result.id, 'cmpl-meta');
+    assert.equal(result.model, 'provider/served-model');
+    assert.equal(result.finishReason, 'content_filter');
+    assert.equal(result.nativeFinishReason, 'content_filter');
+});
+
+test('unreported response metadata is null; onStep carries the same fields per round-trip', async (t) => {
+    const events = [];
+    const { agent } = makeAgent(t, [
+        completion(toolCallsMessage([toolCall('call_1', 'read', { path: 'a.txt' })])),
+        completion(textMessage('done'))
+    ], { onStep: (event) => events.push(event) });
+    await agent.workspace.put('a.txt', 'AAA');
+
+    const result = await agent.run('read a.txt');
+
+    // the completion() helper sets id and finish_reason but no model/native_finish_reason
+    assert.equal(result.id, 'cmpl-test');
+    assert.equal(result.model, null);
+    assert.equal(result.finishReason, 'stop');
+    assert.equal(result.nativeFinishReason, null);
+    assert.equal(events.length, 2);
+    for (const [i, event] of events.entries()) {
+        assert.equal(event.id, 'cmpl-test');
+        assert.equal(event.finishReason, 'stop');
+        assert.equal(event.model, null);
+        assert.equal(event.nativeFinishReason, null);
+        assert.equal(event.step, i + 1);
+    }
+});
+
 test('reasoning blocks on assistant messages are round-tripped to the next turn verbatim', async (t) => {
     const reasoningTurn = {
         role: 'assistant',

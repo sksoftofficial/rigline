@@ -1,6 +1,6 @@
 {
     "name": "@sksoftofficial/rigline",
-    "version": "0.1.0",
+    "version": "0.2.0",
     "description": "Embeddable Node.js LLM agent loop with caller-registered tools (OpenRouter / OpenAI-compatible transport)",
     "type": "module",
     "license": "MIT",

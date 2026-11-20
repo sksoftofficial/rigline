@@ -282,13 +282,26 @@ export class Agent {
                 accumulateUsage(totalUsage, data.usage);
                 steps += 1;
 
-                const message = data.choices?.[0]?.message;
+                const choice = data.choices?.[0];
+                const message = choice?.message;
                 if (!message || typeof message !== 'object') {
                     const err = new Error(`Unexpected provider response (missing choices[0].message): ${JSON.stringify(data).slice(0, 500)}`);
                     err.name = 'UnexpectedResponseError';
                     throw err;
                 }
                 messages.push(message);
+
+                // Per-round-trip response metadata, verbatim when the provider
+                // reports it (null otherwise): finishReason lets hosts react to
+                // content_filter etc., id and model carry logging/billing
+                // attribution. Surfaced on every onStep event and — from the
+                // final round-trip — on the run() result.
+                const responseMeta = {
+                    id: typeof data.id === 'string' ? data.id : null,
+                    model: typeof data.model === 'string' ? data.model : null,
+                    finishReason: typeof choice.finish_reason === 'string' ? choice.finish_reason : null,
+                    nativeFinishReason: typeof choice.native_finish_reason === 'string' ? choice.native_finish_reason : null,
+                };
 
                 const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
                 if (toolCalls.length === 0) {
@@ -297,9 +310,10 @@ export class Agent {
                         text: typeof message.content === 'string' ? message.content : '',
                         messages,
                         steps,
-                        usage
+                        usage,
+                        ...responseMeta
                     };
-                    this._onStep?.({ step: steps, message, toolResults: [], usage });
+                    this._onStep?.({ step: steps, message, toolResults: [], usage, ...responseMeta });
                     return result;
                 }
 
@@ -309,7 +323,7 @@ export class Agent {
                     toolResults.push({ toolCallId: call?.id, name: call?.function?.name, content });
                     messages.push({ role: 'tool', tool_call_id: call?.id, content });
                 }
-                this._onStep?.({ step: steps, message, toolResults, usage: snapshotUsage(totalUsage) });
+                this._onStep?.({ step: steps, message, toolResults, usage: snapshotUsage(totalUsage), ...responseMeta });
             }
         } finally {
             this._runInFlight = false;

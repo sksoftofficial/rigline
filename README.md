@@ -41,7 +41,8 @@ const agent = new Agent({
 await agent.workspace.put('notes.txt', notes);    // stage files into this run's session workspace
 
 const result = await agent.run('Read notes.txt and draft a headline into draft.md');
-// result: { text, messages, steps, usage: { promptTokens, completionTokens, totalTokens, reasoningTokens?, cachedTokens?, cost? } }
+// result: { text, messages, steps, usage: { promptTokens, completionTokens, totalTokens, reasoningTokens?, cachedTokens?, cost? },
+//           id, model, finishReason, nativeFinishReason }
 // read/write/edit/patch/glob/grep are registered by default — confined to the
 // per-run session folder, created lazily, cleaned up when the run settles.
 ```
@@ -121,6 +122,11 @@ const next = await agent.run([...result.messages, { role: 'user', content: 'Now 
   Detail readers accept the OpenRouter/OpenAI names (`prompt_tokens_details.cached_tokens`,
   `completion_tokens_details.reasoning_tokens`) and the Anthropic-style aliases
   (`cached_tokens`, `cache_read_input_tokens`, `reasoning_tokens`, `output_tokens_details.reasoning_tokens`).
+- Response metadata from the **final** round-trip: `id`, `model` (as served, not as
+  requested), `finishReason`, `nativeFinishReason` (OpenRouter's provider-native value) —
+  each `null` when the provider did not report it. Hosts read `finishReason` to react to
+  `content_filter` and friends; every `onStep` event carries the same four fields for the
+  round-trip it describes.
 
 ### `agent.runJson(input)` → parsed JSON
 
@@ -132,7 +138,8 @@ accordingly.
 ### `onStep(event)` — fires once per model round-trip
 
 ```js
-{ step: 3, message: <assistant message>, toolResults: [{ toolCallId, name, content }], usage: {...} }
+{ step: 3, message: <assistant message>, toolResults: [{ toolCallId, name, content }], usage: {...},
+  id, model, finishReason, nativeFinishReason }
 ```
 
 `toolResults` is `[]` on the final (tool-free) step. `content` for failed calls starts with `Error: `.
